@@ -11,9 +11,17 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // Exposed by the ec_su_axb35 driver, which reads EC register 0x31 — the
 // register the physical P-MODE button sets. The driver does not call
-// sysfs_notify(), so no event is available and we have to poll.
+// sysfs_notify(), so no event is available and we have to poll. Every read
+// is an ACPI EC transaction, so keep this interval conservative.
 const PMODE_PATH = '/sys/class/ec_su_axb35/apu/power_mode';
-const POLL_SECONDS = 3;
+const PMODE_POLL_SECONDS = 3;
+
+// Live APU package power, published by amdgpu in microwatts. A plain sysfs
+// read with no EC involved, so it can be polled a little faster. The hwmon
+// number is not stable across boots and is resolved at runtime.
+const HWMON_DIR = '/sys/class/hwmon';
+const POWER_ATTR = 'power1_average';
+const POWER_POLL_SECONDS = 2;
 
 // NOTE: the embedded controller stores an ordinal (0/1/2), not a wattage.
 // The figures below are those of the GMKtec EVO-X2. Other vendors using the
@@ -30,19 +38,31 @@ class PModeIndicator extends PanelMenu.Button {
     _init() {
         super._init(0.5, 'P-MODE Indicator');
 
-        this._file = Gio.File.new_for_path(PMODE_PATH);
+        this._modeFile = Gio.File.new_for_path(PMODE_PATH);
+        this._powerFile = this._findPowerFile();
         this._mode = undefined;
-        this._cancellable = null;
+        this._power = null;
+        this._modeCancellable = null;
+        this._powerCancellable = null;
 
         // Emoji rather than a symbolic icon: the Adwaita power-profile icons
         // are already used by GNOME's own Power Mode menu, which shows a
         // different thing entirely (the amd_pstate EPP hint, not the EC budget).
-        this._label = new St.Label({
+        // Two labels so the reading can carry its own font size. Reading
+        // first, emoji on the right.
+        const box = new St.BoxLayout({style_class: 'pmode-box'});
+        this._emojiLabel = new St.Label({
             text: '…',
             y_align: Clutter.ActorAlign.CENTER,
-            style_class: 'pmode-label',
         });
-        this.add_child(this._label);
+        this._wattsLabel = new St.Label({
+            text: '',
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'pmode-watts',
+        });
+        box.add_child(this._wattsLabel);
+        box.add_child(this._emojiLabel);
+        this.add_child(box);
 
         this._items = new Map();
         for (const key of ORDER) {
@@ -60,20 +80,57 @@ class PModeIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._statusItem);
 
-        this._read();
-        this._timeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
-                this._read();
+        this._readMode();
+        this._modeTimeoutId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT, PMODE_POLL_SECONDS, () => {
+                this._readMode();
                 return GLib.SOURCE_CONTINUE;
             });
+
+        if (this._powerFile) {
+            this._readPower();
+            this._powerTimeoutId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT, POWER_POLL_SECONDS, () => {
+                    this._readPower();
+                    return GLib.SOURCE_CONTINUE;
+                });
+        }
     }
 
-    _read() {
-        if (this._cancellable)
+    // The amdgpu hwmon index varies between boots, so look it up by name.
+    _findPowerFile() {
+        const dir = Gio.File.new_for_path(HWMON_DIR);
+        let iter;
+        try {
+            iter = dir.enumerate_children('standard::name',
+                Gio.FileQueryInfoFlags.NONE, null);
+        } catch {
+            return null;
+        }
+
+        let info;
+        while ((info = iter.next_file(null)) !== null) {
+            const hwmon = dir.get_child(info.get_name());
+            try {
+                const [ok, contents] = hwmon.get_child('name').load_contents(null);
+                if (!ok || new TextDecoder().decode(contents).trim() !== 'amdgpu')
+                    continue;
+            } catch {
+                continue;
+            }
+            const power = hwmon.get_child(POWER_ATTR);
+            if (power.query_exists(null))
+                return power;
+        }
+        return null;
+    }
+
+    _readMode() {
+        if (this._modeCancellable)
             return; // previous read still in flight
-        this._cancellable = new Gio.Cancellable();
-        this._file.load_contents_async(this._cancellable, (file, res) => {
-            this._cancellable = null;
+        this._modeCancellable = new Gio.Cancellable();
+        this._modeFile.load_contents_async(this._modeCancellable, (file, res) => {
+            this._modeCancellable = null;
             let mode = null;
             try {
                 const [ok, contents] = file.load_contents_finish(res);
@@ -84,23 +141,60 @@ class PModeIndicator extends PanelMenu.Button {
                     return;
                 mode = null;
             }
-            this._update(mode);
+            this._updateMode(mode);
         });
     }
 
-    _update(mode) {
+    _readPower() {
+        if (this._powerCancellable)
+            return;
+        this._powerCancellable = new Gio.Cancellable();
+        this._powerFile.load_contents_async(this._powerCancellable, (file, res) => {
+            this._powerCancellable = null;
+            let watts = null;
+            try {
+                const [ok, contents] = file.load_contents_finish(res);
+                if (ok) {
+                    const uw = parseInt(new TextDecoder().decode(contents).trim(), 10);
+                    if (Number.isFinite(uw))
+                        watts = Math.round(uw / 1000000);
+                }
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+            }
+            if (watts !== this._power) {
+                this._power = watts;
+                this._setLabel();
+            }
+        });
+    }
+
+    // Panel shows the live draw with the button position to its right,
+    // e.g. "34 W ⚖️".
+    // The reading is padded with U+2007 FIGURE SPACE, whose advance equals a
+    // digit's, so the indicator keeps a constant width from 9 W to 115 W
+    // instead of nudging its neighbours in the panel every couple of seconds.
+    _setLabel() {
+        const info = MODES[this._mode];
+        this._emojiLabel.text = info ? info.emoji : '?';
+        this._wattsLabel.text = this._power === null
+            ? ''
+            : `${String(this._power).padStart(3, '\u2007')} W`;
+    }
+
+    _updateMode(mode) {
         if (mode === this._mode)
             return;
         this._mode = mode;
+        this._setLabel();
 
         const info = MODES[mode];
         if (info) {
-            this._label.text = info.emoji;
             this._statusItem.label.text =
                 `P-MODE button: ${info.label} — ${info.watts} W`;
         } else {
-            this._label.text = '?';
-            this._statusItem.label.text = this._file.query_exists(null)
+            this._statusItem.label.text = this._modeFile.query_exists(null)
                 ? 'Unexpected EC value'
                 : 'ec_su_axb35 module not loaded';
         }
@@ -113,12 +207,16 @@ class PModeIndicator extends PanelMenu.Button {
     }
 
     destroy() {
-        if (this._timeoutId) {
-            GLib.Source.remove(this._timeoutId);
-            this._timeoutId = null;
+        for (const id of ['_modeTimeoutId', '_powerTimeoutId']) {
+            if (this[id]) {
+                GLib.Source.remove(this[id]);
+                this[id] = null;
+            }
         }
-        this._cancellable?.cancel();
-        this._cancellable = null;
+        this._modeCancellable?.cancel();
+        this._powerCancellable?.cancel();
+        this._modeCancellable = null;
+        this._powerCancellable = null;
         super.destroy();
     }
 });

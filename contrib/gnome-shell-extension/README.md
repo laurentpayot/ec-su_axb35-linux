@@ -1,14 +1,16 @@
 # GNOME Shell Extension
-Shows the position of the physical P-MODE button in the top bar.
+Shows the live APU power draw in the top bar, with the position of the
+physical P-MODE button to its right.
 
 | Button position | Top bar |
 |---|---|
-| `quiet`       | 🌿 |
-| `balanced`    | ⚖️ |
-| `performance` | 🚀 |
+| `quiet`       | 34 W 🌿 |
+| `balanced`    | 34 W ⚖️ |
+| `performance` | 34 W 🚀 |
 
-The drop-down repeats the three modes with their wattage and marks the active
-one. Read-only — the button is physical, writing to the EC would need root.
+The drop-down repeats the three modes with their nominal wattage and marks the
+active one. Read-only — the button is physical, writing to the EC would need
+root.
 
 GNOME's own Power Mode menu cannot show this: without an ACPI `platform_profile`
 on this board, power-profiles-daemon only drives the `amd_pstate` EPP hint and
@@ -25,7 +27,16 @@ never touches the embedded controller.
    cannot be restarted in place).
 4. `gnome-extensions enable axb35-pmode@ec-su_axb35-linux`
 
-### Wattage labels
+### Live power reading
+The figure next to the emoji is the APU package power published by `amdgpu` in
+`/sys/class/hwmon/hwmonN/power1_average`. The hwmon index changes between boots,
+so it is resolved at startup by looking for the one whose `name` is `amdgpu`. If
+no such hwmon is found the extension simply shows the emoji alone.
+
+Note that this is the current draw, not the budget: a short burst boosts well
+above the nominal figure before the sustained limit takes over.
+
+### Wattage labels in the menu
 The EC stores an ordinal (`0x00`=balanced, `0x01`=performance, `0x02`=quiet),
 not a wattage. The 55 / 85 / 120 W figures are those of the GMKtec EVO-X2 and
 are **not read from the hardware**. If your vendor ships different presets,
@@ -34,5 +45,6 @@ edit `MODES` at the top of `extension.js`.
 ### Notes
 The driver does not call `sysfs_notify()`, so the extension polls
 `/sys/class/ec_su_axb35/apu/power_mode` every 3 seconds with an asynchronous
-read. Tested on GNOME Shell 50 (Ubuntu 26.04); the APIs used are unchanged
-since GNOME 45.
+read. The power reading is a plain sysfs read with no EC transaction involved
+and uses its own 2 second timer. Tested on GNOME Shell 50 (Ubuntu 26.04); the
+APIs used are unchanged since GNOME 45.

@@ -1,9 +1,9 @@
 {
   "uuid": "axb35-pmode@ec-su_axb35-linux",
   "name": "AXB35 P-MODE Indicator",
-  "description": "Shows the position of the physical P-MODE button in the GNOME top bar. Requires the ec_su_axb35 kernel module.",
+  "description": "Shows the position of the physical P-MODE button in the GNOME top bar, together with the live APU power draw. Requires the ec_su_axb35 kernel module.",
   "shell-version": ["48", "49", "50"],
-  "version-name": "1.0",
+  "version-name": "1.1",
   "license": "GPL-2.0-or-later",
   "url": "https://github.com/cmetz/ec-su_axb35-linux"
 }
