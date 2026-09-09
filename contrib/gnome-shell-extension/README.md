@@ -8,9 +8,10 @@ physical P-MODE button to its right.
 | `balanced`    | 34 W ⚖️ |
 | `performance` | 34 W 🚀 |
 
-The drop-down repeats the three modes with their nominal wattage and marks the
-active one. Read-only — the button is physical, writing to the EC would need
-root.
+The drop-down repeats the three modes with their nominal wattage, marks the
+active one, and carries a switch to turn the live reading on or off. Read-only
+as far as the hardware goes — the button is physical, writing to the EC would
+need root.
 
 GNOME's own Power Mode menu cannot show this: without an ACPI `platform_profile`
 on this board, power-profiles-daemon only drives the `amd_pstate` EPP hint and
@@ -28,10 +29,17 @@ never touches the embedded controller.
 4. `gnome-extensions enable axb35-pmode@ec-su_axb35-linux`
 
 ### Live power reading
-The figure next to the emoji is the APU package power published by `amdgpu` in
+The figure left of the emoji is the APU package power published by `amdgpu` in
 `/sys/class/hwmon/hwmonN/power1_average`. The hwmon index changes between boots,
 so it is resolved at startup by looking for the one whose `name` is `amdgpu`. If
-no such hwmon is found the extension simply shows the emoji alone.
+no such hwmon is found the extension simply shows the emoji alone and the switch
+is greyed out.
+
+The switch is stored in GSettings (`show-power`, default on) and survives a
+session. Turning it off stops the polling entirely rather than just hiding the
+figure. `schemas/gschemas.compiled` is committed so the extension works from a
+plain copy; regenerate it with `glib-compile-schemas schemas/` if you edit the
+XML.
 
 Note that this is the current draw, not the budget: a short burst boosts well
 above the nominal figure before the sustained limit takes over.

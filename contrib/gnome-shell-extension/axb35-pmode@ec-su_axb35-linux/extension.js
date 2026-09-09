@@ -35,15 +35,18 @@ const ORDER = ['quiet', 'balanced', 'performance'];
 
 const PModeIndicator = GObject.registerClass(
 class PModeIndicator extends PanelMenu.Button {
-    _init() {
+    _init(settings) {
         super._init(0.5, 'P-MODE Indicator');
 
+        this._settings = settings;
         this._modeFile = Gio.File.new_for_path(PMODE_PATH);
         this._powerFile = this._findPowerFile();
         this._mode = undefined;
         this._power = null;
         this._modeCancellable = null;
         this._powerCancellable = null;
+        this._modeTimeoutId = null;
+        this._powerTimeoutId = null;
 
         // Emoji rather than a symbolic icon: the Adwaita power-profile icons
         // are already used by GNOME's own Power Mode menu, which shows a
@@ -51,14 +54,14 @@ class PModeIndicator extends PanelMenu.Button {
         // Two labels so the reading can carry its own font size. Reading
         // first, emoji on the right.
         const box = new St.BoxLayout({style_class: 'pmode-box'});
-        this._emojiLabel = new St.Label({
-            text: '…',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
         this._wattsLabel = new St.Label({
             text: '',
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'pmode-watts',
+        });
+        this._emojiLabel = new St.Label({
+            text: '…',
+            y_align: Clutter.ActorAlign.CENTER,
         });
         box.add_child(this._wattsLabel);
         box.add_child(this._emojiLabel);
@@ -73,11 +76,29 @@ class PModeIndicator extends PanelMenu.Button {
             this.menu.addMenuItem(item);
             this._items.set(key, item);
         }
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._statusItem = new PopupMenu.PopupMenuItem('Reading…', {
+        this._powerSwitch = new PopupMenu.PopupSwitchMenuItem(
+            'Live power reading', this._settings.get_boolean('show-power'));
+        this._powerSwitch.connect('toggled', (item, state) => {
+            this._settings.set_boolean('show-power', state);
+        });
+        if (!this._powerFile)
+            this._powerSwitch.setSensitive(false);
+        this.menu.addMenuItem(this._powerSwitch);
+        this._settingsId = this._settings.connect('changed::show-power', () => {
+            this._powerSwitch.state = this._settings.get_boolean('show-power');
+            this._syncPowerPolling();
+        });
+
+        // Only shown when something is wrong: with the panel and the check
+        // mark both saying which mode is active, a status line would be
+        // redundant the rest of the time.
+        this._statusItem = new PopupMenu.PopupMenuItem('', {
             reactive: false,
             style_class: 'pmode-status-item',
         });
+        this._statusItem.visible = false;
         this.menu.addMenuItem(this._statusItem);
 
         this._readMode();
@@ -86,15 +107,7 @@ class PModeIndicator extends PanelMenu.Button {
                 this._readMode();
                 return GLib.SOURCE_CONTINUE;
             });
-
-        if (this._powerFile) {
-            this._readPower();
-            this._powerTimeoutId = GLib.timeout_add_seconds(
-                GLib.PRIORITY_DEFAULT, POWER_POLL_SECONDS, () => {
-                    this._readPower();
-                    return GLib.SOURCE_CONTINUE;
-                });
-        }
+        this._syncPowerPolling();
     }
 
     // The amdgpu hwmon index varies between boots, so look it up by name.
@@ -123,6 +136,28 @@ class PModeIndicator extends PanelMenu.Button {
                 return power;
         }
         return null;
+    }
+
+    // Nothing is polled while the reading is switched off.
+    _syncPowerPolling() {
+        const wanted = this._powerFile !== null &&
+            this._settings.get_boolean('show-power');
+
+        if (wanted && !this._powerTimeoutId) {
+            this._readPower();
+            this._powerTimeoutId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT, POWER_POLL_SECONDS, () => {
+                    this._readPower();
+                    return GLib.SOURCE_CONTINUE;
+                });
+        } else if (!wanted && this._powerTimeoutId) {
+            GLib.Source.remove(this._powerTimeoutId);
+            this._powerTimeoutId = null;
+            this._powerCancellable?.cancel();
+            this._powerCancellable = null;
+            this._power = null;
+            this._setLabel();
+        }
     }
 
     _readMode() {
@@ -171,16 +206,15 @@ class PModeIndicator extends PanelMenu.Button {
     }
 
     // Panel shows the live draw with the button position to its right,
-    // e.g. "34 W ⚖️".
-    // The reading is padded with U+2007 FIGURE SPACE, whose advance equals a
-    // digit's, so the indicator keeps a constant width from 9 W to 115 W
-    // instead of nudging its neighbours in the panel every couple of seconds.
+    // e.g. "34 W ⚖️". The reading is padded with U+2007 FIGURE SPACE, whose
+    // advance equals a digit's, so the indicator keeps a constant width from
+    // 9 W to 115 W instead of nudging its neighbours every couple of seconds.
     _setLabel() {
         const info = MODES[this._mode];
         this._emojiLabel.text = info ? info.emoji : '?';
         this._wattsLabel.text = this._power === null
             ? ''
-            : `${String(this._power).padStart(3, '\u2007')} W`;
+            : `${String(this._power).padStart(3, ' ')} W`;
     }
 
     _updateMode(mode) {
@@ -191,18 +225,21 @@ class PModeIndicator extends PanelMenu.Button {
 
         const info = MODES[mode];
         if (info) {
-            this._statusItem.label.text =
-                `P-MODE button: ${info.label} — ${info.watts} W`;
+            this._statusItem.visible = false;
         } else {
             this._statusItem.label.text = this._modeFile.query_exists(null)
                 ? 'Unexpected EC value'
                 : 'ec_su_axb35 module not loaded';
+            this._statusItem.visible = true;
         }
 
         for (const [key, item] of this._items) {
+            // NONE keeps the ornament column, so the checked entry stays
+            // aligned with the others, but draws nothing — NO_DOT would put
+            // an empty circle in front of every inactive mode.
             item.setOrnament(key === mode
                 ? PopupMenu.Ornament.CHECK
-                : PopupMenu.Ornament.NO_DOT);
+                : PopupMenu.Ornament.NONE);
         }
     }
 
@@ -217,13 +254,18 @@ class PModeIndicator extends PanelMenu.Button {
         this._powerCancellable?.cancel();
         this._modeCancellable = null;
         this._powerCancellable = null;
+        if (this._settingsId) {
+            this._settings.disconnect(this._settingsId);
+            this._settingsId = null;
+        }
+        this._settings = null;
         super.destroy();
     }
 });
 
 export default class PModeIndicatorExtension extends Extension {
     enable() {
-        this._indicator = new PModeIndicator();
+        this._indicator = new PModeIndicator(this.getSettings());
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
     }
 
